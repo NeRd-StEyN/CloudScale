@@ -1,0 +1,7 @@
+{
+  "name": "CloudScale",
+  "description": "Developer-first edge cloud platform with global microVM deployments, real-time 3D topology telemetry, and container orchestration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
