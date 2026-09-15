@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { ThreeMicroVmScene } from './ThreeMicroVmScene.tsx';
 import { CloudScaleLogo } from './CloudScaleLogo.tsx';
 import { ServiceWorkload, DomainItem, TerminalLog } from '../types.ts';
-import { useAuth, UserButton, SignedIn, RedirectToSignIn } from '@clerk/clerk-react';
+import { useAuth, UserButton, SignedIn, RedirectToSignIn, useUser } from '@clerk/clerk-react';
 
 interface ConsoleDashboardProps {
   onNavigateToLanding: () => void;
@@ -10,6 +10,35 @@ interface ConsoleDashboardProps {
 
 export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateToLanding }) => {
   const { getToken, isLoaded, isSignedIn } = useAuth();
+  const { user } = useUser();
+
+  const hasGitHubConnected = user?.externalAccounts.some(
+    account =>
+      account.provider === 'oauth_github' ||
+      account.provider === 'github' ||
+      account.verification?.strategy === 'oauth_github'
+  ) || false;
+
+  const handleConnectGitHub = async () => {
+    if (!user) return;
+    try {
+      const externalAccount = await user.createExternalAccount({
+        strategy: 'oauth_github',
+        redirectUrl: window.location.href,
+        redirect_url: window.location.href, // fallback for older Clerk sdks
+      } as any);
+
+      const authUrl = externalAccount.verification?.externalVerificationRedirectURL?.href;
+      if (authUrl) {
+        window.location.href = authUrl;
+      } else {
+        console.warn('No redirect URL found:', externalAccount);
+      }
+    } catch (err: any) {
+      console.error('Failed to connect GitHub:', err);
+      alert('Failed to connect GitHub: ' + (err.errors?.[0]?.message || err.message || 'Unknown error'));
+    }
+  };
 
   const [services, setServices] = useState<ServiceWorkload[]>([]);
   const [filter, setFilter] = useState<'all' | 'http' | 'workers'>('all');
@@ -17,8 +46,18 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
   const [selectedVpc, setSelectedVpc] = useState<string>('prod-primary-vpc');
   const [deployRepoUrl, setDeployRepoUrl] = useState<string>('https://github.com/cloudscale-labs/api-gateway');
   const [deployBranch, setDeployBranch] = useState<string>('main');
+  const [githubRepos, setGithubRepos] = useState<any[]>([]);
+  const [isLoadingRepos, setIsLoadingRepos] = useState<boolean>(false);
+  const [isCustomUrl, setIsCustomUrl] = useState<boolean>(false);
+  const [debugOutput, setDebugOutput] = useState<string>('');
+  const [branches, setBranches] = useState<string[]>(['main']);
+  const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
+  const [detectedFramework, setDetectedFramework] = useState<string>('');
+  const [systemMetrics, setSystemMetrics] = useState<{ memUsedMb: number, memTotalMb: number, cpuPercent: number, bandwidthGb: number } | null>(null);
   const [isDeploying, setIsDeploying] = useState<boolean>(false);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [showEnvVars, setShowEnvVars] = useState<boolean>(false);
+  const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([{ key: '', value: '' }]);
   const [logs, setLogs] = useState<TerminalLog[]>([]);
   const [logFilter, setLogFilter] = useState<string>('');
   const [activeLogTab, setActiveLogTab] = useState<'build' | 'runtime' | 'access'>('build');
@@ -83,6 +122,100 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
     }
   }, [isSignedIn, getToken]);
 
+  useEffect(() => {
+    const fetchRepos = async () => {
+      if (!hasGitHubConnected || !isSignedIn) {
+        setDebugOutput(`Skipped. hasGitHubConnected=${hasGitHubConnected}, isSignedIn=${isSignedIn}`);
+        return;
+      }
+      setIsLoadingRepos(true);
+      setDebugOutput('Fetching...');
+      try {
+        const token = await getToken();
+        if (!token) {
+          setDebugOutput(`Token is null!`);
+          return;
+        }
+        const res = await fetch('/api/github/repos', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setDebugOutput(`Success! Fetched ${data.repos?.length} repos.`);
+          setGithubRepos(data.repos || []);
+          if (data.repos?.length > 0 && deployRepoUrl === 'https://github.com/cloudscale-labs/api-gateway') {
+            setDeployRepoUrl(data.repos[0].html_url);
+          }
+        } else {
+          setDebugOutput(`Failed: ${res.status} ${res.statusText}. Body: ${await res.text()}`);
+        }
+      } catch (err: any) {
+        setDebugOutput(`Error: ${err.message}`);
+        console.error('Failed to fetch repos', err);
+      } finally {
+        setIsLoadingRepos(false);
+      }
+    };
+    fetchRepos();
+  }, [hasGitHubConnected, isSignedIn, getToken]);
+
+  // Fetch real branches when selected repo changes
+  useEffect(() => {
+    const fetchBranches = async () => {
+      if (!deployRepoUrl || isCustomUrl || !deployRepoUrl.includes('github.com')) return;
+      // Extract owner/repo from URL e.g. https://github.com/owner/repo
+      const match = deployRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+      if (!match) return;
+      const [, owner, repo] = match;
+      setIsLoadingBranches(true);
+      try {
+        const token = await getToken();
+        // Fetch branches
+        const branchRes = await fetch(`/api/github/branches?owner=${owner}&repo=${repo}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (branchRes.ok) {
+          const { branches: b } = await branchRes.json();
+          setBranches(b || ['main']);
+          if (b && b.length > 0 && !b.includes(deployBranch)) setDeployBranch(b[0]);
+        }
+        // Detect framework
+        const pkgRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/HEAD/package.json`);
+        if (pkgRes.ok) {
+          const pkg = await pkgRes.json();
+          const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+          if (deps['next']) setDetectedFramework(`Next.js ${deps['next'].replace(/[^\d.]/g, '')}`);
+          else if (deps['vite']) setDetectedFramework('Vite');
+          else if (deps['react-scripts']) setDetectedFramework('Create React App');
+          else if (deps['@angular/core']) setDetectedFramework('Angular');
+          else if (deps['vue']) setDetectedFramework('Vue.js');
+          else if (deps['express']) setDetectedFramework('Express.js');
+          else setDetectedFramework('');
+        } else {
+          setDetectedFramework('');
+        }
+      } catch {
+        setBranches(['main']);
+      } finally {
+        setIsLoadingBranches(false);
+      }
+    };
+    fetchBranches();
+  }, [deployRepoUrl, isCustomUrl, getToken]);
+
+  // Fetch real system metrics
+  useEffect(() => {
+    const fetchMetrics = async () => {
+      try {
+        const res = await fetch('/api/metrics');
+        if (res.ok) setSystemMetrics(await res.json());
+      } catch { }
+    };
+    fetchMetrics();
+    const interval = setInterval(fetchMetrics, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
   const handleSyncCluster = () => {
     setIsSyncing(true);
     setTimeout(() => {
@@ -108,14 +241,18 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
       const token = await getToken();
       const res = await fetch('/api/deploy', {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ repoUrl: deployRepoUrl })
+        body: JSON.stringify({
+          repoUrl: deployRepoUrl,
+          branch: deployBranch,
+          envVars: envVars.filter(e => e.key.trim() !== '').reduce((acc, e) => ({ ...acc, [e.key.trim()]: e.value }), {})
+        })
       });
       const data = await res.json();
-      
+
       if (!res.ok) {
         throw new Error(data.error || 'Deploy failed');
       }
@@ -135,11 +272,11 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               message: msg
             }));
             setLogs(newLogs);
-            
+
             if (newLogs.some((l: any) => l.message.includes('Deployment active at') || l.message.includes('failed'))) {
               clearInterval(interval);
               setIsDeploying(false);
-              
+
               if (newLogs.some((l: any) => l.message.includes('Deployment active at'))) {
                 const newS: ServiceWorkload = {
                   id: data.id,
@@ -185,10 +322,10 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
       prev.map((s) =>
         s.id === targetServiceId
           ? {
-              ...s,
-              replicas: replicaCount,
-              replicasSummary: `${replicaCount} Replicas`,
-            }
+            ...s,
+            replicas: replicaCount,
+            replicasSummary: `${replicaCount} Replicas`,
+          }
           : s,
       ),
     );
@@ -198,9 +335,8 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
       {
         timestamp: `${now}.230`,
         level: 'RUN',
-        message: `Replica scaling applied: target=${
-          services.find((s) => s.id === targetServiceId)?.name
-        } count=${replicaCount} (${(replicaCount * 0.25).toFixed(1)} vCPU, ${replicaCount * 512} MB RAM)`,
+        message: `Replica scaling applied: target=${services.find((s) => s.id === targetServiceId)?.name
+          } count=${replicaCount} (${(replicaCount * 0.25).toFixed(1)} vCPU, ${replicaCount * 512} MB RAM)`,
       },
     ]);
     setTimeout(() => setIsScalingApplied(false), 1500);
@@ -229,7 +365,7 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
   }).filter((s) => {
     if (!globalSearch.trim()) return true;
     return s.name.toLowerCase().includes(globalSearch.toLowerCase()) ||
-           s.region.toLowerCase().includes(globalSearch.toLowerCase());
+      s.region.toLowerCase().includes(globalSearch.toLowerCase());
   });
 
   const filteredLogs = logs.filter((log) => {
@@ -297,42 +433,17 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
 
         {/* Center / Right Search & Actions */}
         <div className="flex items-center gap-3">
-          {/* Search bar */}
-          <div className="relative hidden sm:flex items-center">
-            <span className="material-symbols-outlined absolute left-2.5 text-[#86948a] text-[18px]">search</span>
-            <input
-              type="text"
-              value={globalSearch}
-              onChange={(e) => setGlobalSearch(e.target.value)}
-              placeholder="Search resources, metrics..."
-              className="bg-[#1c1b1d]/80 backdrop-blur-sm text-[#e5e1e4] pl-8 pr-12 py-1 font-mono text-xs rounded-lg border border-[#3c4a42] focus:outline-none focus:border-[#4cd7f6] focus:ring-1 focus:ring-[#4cd7f6] w-60 transition-all"
-            />
-            <kbd className="absolute right-2 px-1.5 py-0.5 text-[10px] font-mono bg-[#2a2a2c] text-[#bbcabf] rounded border border-[#3c4a42]">
-              Cmd+K
-            </kbd>
-          </div>
-
           {/* Quick Action Icons */}
           <div className="flex items-center space-x-1">
             <button
-              onClick={() => alert('No active alerts. All 4 regions healthy.')}
+              onClick={() => alert('No active alerts.')}
               className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
               title="Notifications"
             >
               <span className="material-symbols-outlined text-[18px]">notifications</span>
             </button>
             <button
-              onClick={() => {
-                const el = document.getElementById('deployment-logs-section');
-                el?.scrollIntoView({ behavior: 'smooth' });
-              }}
-              className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
-              title="Terminal Logs"
-            >
-              <span className="material-symbols-outlined text-[18px]">terminal</span>
-            </button>
-            <button
-              onClick={() => alert('CloudScale Help: Docs, API specs, and CLI instructions available in sidebar.')}
+              onClick={() => alert('Help: Docs, API specs, and CLI instructions available in sidebar.')}
               className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
               title="Help"
             >
@@ -340,17 +451,7 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
             </button>
           </div>
 
-          {/* Deploy Repository CTA */}
-          <button
-            onClick={handleDeploy}
-            disabled={isDeploying}
-            className="hidden lg:flex items-center gap-1.5 bg-[#4edea3] text-[#003824] text-xs font-semibold px-3 py-1.5 rounded hover:bg-[#6ffbbe] active:scale-95 transition-all shadow-sm shadow-[#4edea3]/20 btn-glow-primary"
-          >
-            <span className={`material-symbols-outlined text-[16px] ${isDeploying ? 'animate-spin' : ''}`}>
-              {isDeploying ? 'progress_activity' : 'add'}
-            </span>
-            <span>{isDeploying ? 'Deploying...' : 'Deploy Repository'}</span>
-          </button>
+
 
           {/* User Avatar */}
           <div className="relative ml-1 cursor-pointer flex items-center justify-center">
@@ -364,16 +465,15 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
         {/* Sidebar */}
         <aside className="hidden md:flex w-60 h-[calc(100vh-3.5rem)] flex-col justify-between py-4 px-3 bg-[#0e0e10]/95 backdrop-blur-md border-r border-[#3c4a42] shrink-0 sticky top-14 overflow-y-auto">
           <div className="space-y-4">
-            {/* Project / VPC Selector */}
+            {/* Environment Selector */}
             <div className="relative">
               <select
                 value={selectedVpc}
                 onChange={(e) => setSelectedVpc(e.target.value)}
                 className="w-full px-2.5 py-1.5 bg-[#1c1b1d]/90 border border-[#3c4a42] hover:border-[#4edea3]/40 rounded-lg text-xs font-mono text-[#e5e1e4] appearance-none cursor-pointer focus:outline-none focus:border-[#4edea3]"
               >
-                <option value="prod-primary-vpc">prod-primary-vpc (us-east-1)</option>
-                <option value="staging-mesh-eu">staging-mesh-eu (eu-central-fra)</option>
-                <option value="dev-sandbox-apac">dev-sandbox-apac (ap-se-sin)</option>
+                <option value="prod-primary-vpc">Environment (Production)</option>
+                <option value="staging-mesh-eu">Environment (Staging)</option>
               </select>
               <span className="material-symbols-outlined text-[#bbcabf] text-[16px] absolute right-2.5 top-2 pointer-events-none">
                 unfold_more
@@ -386,7 +486,7 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                 { name: 'Overview', icon: 'dashboard' },
                 { name: 'Services & Deployments', icon: 'rocket_launch' },
                 { name: 'Logs & Metrics', icon: 'terminal' },
-                { name: 'Replica Scaling', icon: 'tune' },
+                { name: 'Scaling', icon: 'tune' },
                 { name: 'Subdomain Routing', icon: 'alt_route' },
                 { name: 'Settings', icon: 'settings' },
               ].map((item) => {
@@ -394,12 +494,23 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                 return (
                   <button
                     key={item.name}
-                    onClick={() => setActiveNav(item.name)}
-                    className={`w-full flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-all text-left ${
-                      isActive
+                    onClick={() => {
+                      setActiveNav(item.name);
+                      let sectionId = '';
+                      if (item.name === 'Overview') sectionId = 'overview-section';
+                      if (item.name === 'Services & Deployments') sectionId = 'services-section';
+                      if (item.name === 'Logs & Metrics') sectionId = 'deployment-logs-section';
+                      if (item.name === 'Scaling') sectionId = 'replica-scaling-section';
+                      if (item.name === 'Subdomain Routing') sectionId = 'subdomain-routing-section';
+
+                      if (sectionId) {
+                        document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth' });
+                      }
+                    }}
+                    className={`w-full flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-all text-left ${isActive
                         ? 'text-[#4edea3] bg-[#1c1b1d]/90 border-l-2 border-[#4edea3] font-medium shadow-sm shadow-[#4edea3]/5'
                         : 'text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#1c1b1d]'
-                    }`}
+                      }`}
                   >
                     <span className="material-symbols-outlined text-[18px]">{item.icon}</span>
                     <span>{item.name}</span>
@@ -432,19 +543,15 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
         </aside>
 
         {/* Main Content Canvas */}
-        <main className="flex-1 overflow-y-auto bg-[#0e0e10] px-4 lg:px-8 py-6 max-w-[1440px] mx-auto w-full">
+        <main id="overview-section" className="flex-1 overflow-y-auto bg-[#0e0e10] px-4 lg:px-8 py-6 max-w-[1440px] mx-auto w-full">
           {/* Sub-Header Title Bar */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-[#3c4a42]">
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-2xl text-[#e5e1e4] font-semibold tracking-tight">Production Cluster Overview</h1>
-                <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-[#2a2a2c]/80 text-[#4edea3] border border-[#4edea3]/30 flex items-center gap-1.5 shadow-sm shadow-[#4edea3]/10">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[#4edea3] animate-pulse-glow" />
-                  99.99% Uptime
-                </span>
+                <h1 className="text-2xl text-[#e5e1e4] font-semibold tracking-tight">Project Dashboard</h1>
               </div>
               <p className="text-xs text-[#bbcabf] mt-0.5">
-                Automated high-availability deployment zone connected to AWS us-east-1 Edge ({selectedVpc}).
+                Manage and deploy your applications.
               </p>
             </div>
 
@@ -458,36 +565,9 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                 <span className={`material-symbols-outlined text-[16px] ${isSyncing ? 'animate-spin' : ''}`}>
                   sync
                 </span>
-                <span>{isSyncing ? 'Syncing...' : 'Sync Cluster'}</span>
+                <span>{isSyncing ? 'Syncing...' : 'Sync Deployments'}</span>
               </button>
-              <button
-                onClick={() => {
-                  const name = prompt('Enter new service name:', 'micro-worker');
-                  if (name) {
-                    const newS: ServiceWorkload = {
-                      id: `s_${Date.now()}`,
-                      name: name.toLowerCase().replace(/\s+/g, '-'),
-                      kind: 'http',
-                      status: 'healthy',
-                      environment: 'Production',
-                      region: 'us-east-1',
-                      commitHash: 'b4109c',
-                      branch: 'main',
-                      replicas: 2,
-                      replicasSummary: '2 Replicas',
-                      endpoint: `https://${name.toLowerCase()}.cloudscale.io`,
-                      domains: [`${name.toLowerCase()}.cloudscale.io`],
-                      icon: 'bolt',
-                      iconColor: 'text-[#4edea3]',
-                    };
-                    setServices((prev) => [...prev, newS]);
-                  }
-                }}
-                className="px-3 py-1.5 text-xs bg-[#4edea3] text-[#003824] font-medium rounded hover:bg-[#6ffbbe] transition-all flex items-center gap-1.5 shadow-sm shadow-[#4edea3]/20 btn-glow-primary cursor-pointer"
-              >
-                <span className="material-symbols-outlined text-[16px]">add_circle</span>
-                <span>New Service</span>
-              </button>
+
             </div>
           </div>
 
@@ -497,52 +577,28 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
             <div className="absolute -bottom-10 -left-10 w-72 h-40 bg-[#4cd7f6]/10 rounded-full blur-3xl pointer-events-none" />
 
             <div className="relative z-10 p-5 flex flex-col lg:flex-row items-center justify-between gap-6">
-              {/* Left Side: Telemetry Info */}
+              {/* Left Side: Info */}
               <div className="flex-1 space-y-3 w-full lg:max-w-md">
                 <div className="flex items-center gap-2">
                   <span className="px-2.5 py-1 rounded-md text-[10px] font-mono font-semibold tracking-wider bg-[#4edea3]/10 border border-[#4edea3]/30 text-[#4edea3] flex items-center gap-1.5 shadow-sm shadow-[#4edea3]/20">
                     <span className="w-2 h-2 rounded-full bg-[#4edea3] animate-pulse-glow" />
-                    3D CLUSTER TOPOLOGY (LIVE)
-                  </span>
-                  <span className="text-[11px] font-mono text-[#bbcabf] flex items-center gap-1">
-                    <span className="material-symbols-outlined text-[13px] text-[#4cd7f6]">wifi_tethering</span>
-                    Mesh Sync 12ms
+                    SYSTEM STATUS
                   </span>
                 </div>
 
                 <div>
                   <h3 className="text-lg font-semibold text-[#e5e1e4] tracking-tight">
-                    MicroVM Hypervisor Node Mesh
+                    Global Infrastructure
                   </h3>
                   <p className="text-xs text-[#bbcabf] mt-1 leading-relaxed">
-                    Real-time WebGL representation of isolated Firecracker microVM shards, ingress quantum ring, and
-                    cross-AZ telemetry packets.
+                    Visual representation of your active deployments and server nodes.
                   </p>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2.5 pt-1">
-                  <div className="p-2.5 rounded-lg bg-[#0e0e10]/80 border border-[#3c4a42]/70 backdrop-blur-sm">
-                    <div className="text-[10px] text-[#bbcabf] font-mono">MESH NODES</div>
-                    <div className="text-sm font-mono font-bold text-[#4edea3] mt-0.5">{services.length || 0} Active</div>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-[#0e0e10]/80 border border-[#3c4a42]/70 backdrop-blur-sm">
-                    <div className="text-[10px] text-[#bbcabf] font-mono">VM ISOLATION</div>
-                    <div className="text-sm font-mono font-bold text-[#4cd7f6] mt-0.5">KVM / Jail</div>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-[#0e0e10]/80 border border-[#3c4a42]/70 backdrop-blur-sm">
-                    <div className="text-[10px] text-[#bbcabf] font-mono">BOOT TIME</div>
-                    <div className="text-sm font-mono font-bold text-[#e5e1e4] mt-0.5">4.8 ms</div>
-                  </div>
                 </div>
               </div>
 
               {/* Right Side: 3D Scene */}
               <div className="w-full lg:flex-1 h-48 md:h-56 relative rounded-xl border border-[#3c4a42]/60 bg-[#0e0e10]/80 overflow-hidden flex items-center justify-center shadow-inner">
                 <ThreeMicroVmScene />
-                <div className="absolute bottom-2 right-3 pointer-events-none text-[10px] font-mono text-[#86948a] flex items-center gap-1.5 z-20">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[#4cd7f6] animate-ping" />
-                  <span>PARALLAX CAMERA ACTIVE</span>
-                </div>
               </div>
             </div>
           </section>
@@ -550,56 +606,199 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
           {/* Quick GitHub Repository Deploy Hero Bar */}
           <section className="mt-6 p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] shadow-xl relative overflow-hidden tilt-card">
             <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-4 relative z-10">
-              <div className="flex-1 flex flex-col md:flex-row items-stretch md:items-center gap-3">
-                <div className="relative flex-1">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#bbcabf]">
-                    <span className="material-symbols-outlined text-[18px]">code_blocks</span>
+              {!hasGitHubConnected ? (
+                <div className="flex-1 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-2 text-sm text-[#bbcabf]">
+                    <span className="material-symbols-outlined text-[#4cd7f6]">link</span>
+                    <span>Please connect your GitHub account to enable automatic deployments.</span>
                   </div>
-                  <input
-                    type="text"
-                    value={deployRepoUrl}
-                    onChange={(e) => setDeployRepoUrl(e.target.value)}
-                    className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg pl-9 pr-3 py-2 text-xs font-mono text-[#e5e1e4] focus:outline-none focus:border-[#4cd7f6] focus:ring-1 focus:ring-[#4cd7f6] transition-all"
-                    placeholder="https://github.com/username/repo-name"
-                  />
-                </div>
-
-                <div className="relative min-w-[140px]">
-                  <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-[#bbcabf]">
-                    <span className="material-symbols-outlined text-[16px]">fork_right</span>
-                  </div>
-                  <select
-                    value={deployBranch}
-                    onChange={(e) => setDeployBranch(e.target.value)}
-                    className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg pl-8 pr-8 py-2 text-xs font-mono text-[#e5e1e4] appearance-none focus:outline-none focus:border-[#4cd7f6] cursor-pointer"
+                  <button
+                    onClick={handleConnectGitHub}
+                    className="px-4 py-2 rounded-lg bg-[#2a2a2c] border border-[#3c4a42] text-[#e5e1e4] text-xs font-semibold hover:bg-[#3c4a42] transition-colors flex items-center gap-2 cursor-pointer shadow-sm"
                   >
-                    <option value="main">main</option>
-                    <option value="staging">staging</option>
-                    <option value="feat/v2-preview">feat/v2-preview</option>
-                  </select>
-                  <div className="absolute inset-y-0 right-0 pr-2.5 flex items-center pointer-events-none text-[#bbcabf]">
-                    <span className="material-symbols-outlined text-[16px]">expand_more</span>
+                    <span className="material-symbols-outlined text-[16px]">integration_instructions</span>
+                    Connect GitHub
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="flex-1 flex flex-col md:flex-row items-stretch md:items-center gap-3">
+                    <div className="relative flex-1 flex flex-col gap-2">
+                      {isLoadingRepos ? (
+                        <div className="flex items-center gap-2 text-xs text-[#bbcabf] py-2">
+                          <span className="material-symbols-outlined text-[16px] animate-spin">progress_activity</span>
+                          Loading your repositories...
+                        </div>
+                      ) : (
+                        <div className="relative">
+                          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#bbcabf]">
+                            <span className="material-symbols-outlined text-[18px]">code_blocks</span>
+                          </div>
+                          <select
+                            value={isCustomUrl ? 'custom' : deployRepoUrl}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (val === 'custom') {
+                                setIsCustomUrl(true);
+                                setDeployRepoUrl('');
+                              } else {
+                                setIsCustomUrl(false);
+                                setDeployRepoUrl(val);
+                              }
+                            }}
+                            className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg pl-9 pr-8 py-2 text-xs font-mono text-[#e5e1e4] appearance-none focus:outline-none focus:border-[#4cd7f6] cursor-pointer"
+                          >
+                            {githubRepos.length === 0 && <option value="" disabled>No repositories found</option>}
+                            {githubRepos.map(repo => (
+                              <option key={repo.id} value={repo.html_url}>{repo.full_name}</option>
+                            ))}
+                            <option value="custom">Paste custom URL...</option>
+                          </select>
+                          <div className="absolute inset-y-0 right-0 pr-2.5 flex items-center pointer-events-none text-[#bbcabf]">
+                            <span className="material-symbols-outlined text-[16px]">expand_more</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {isCustomUrl && (
+                        <div className="relative">
+                          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#bbcabf]">
+                            <span className="material-symbols-outlined text-[18px]">link</span>
+                          </div>
+                          <input
+                            type="text"
+                            value={deployRepoUrl}
+                            onChange={(e) => setDeployRepoUrl(e.target.value)}
+                            className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg pl-9 pr-3 py-2 text-xs font-mono text-[#e5e1e4] focus:outline-none focus:border-[#4cd7f6] focus:ring-1 focus:ring-[#4cd7f6] transition-all"
+                            placeholder="https://github.com/username/repo-name"
+                            autoFocus
+                          />
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="relative min-w-[140px]">
+                      <div className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-[#bbcabf]">
+                        <span className="material-symbols-outlined text-[16px]">fork_right</span>
+                      </div>
+                      <select
+                        value={deployBranch}
+                        onChange={(e) => setDeployBranch(e.target.value)}
+                        disabled={isLoadingBranches}
+                        className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg pl-8 pr-8 py-2 text-xs font-mono text-[#e5e1e4] appearance-none focus:outline-none focus:border-[#4cd7f6] cursor-pointer disabled:opacity-50"
+                      >
+                        {isLoadingBranches
+                          ? <option>Loading branches...</option>
+                          : branches.map(b => <option key={b} value={b}>{b}</option>)
+                        }
+                      </select>
+                      <div className="absolute inset-y-0 right-0 pr-2.5 flex items-center pointer-events-none text-[#bbcabf]">
+                        <span className={`material-symbols-outlined text-[16px] ${isLoadingBranches ? 'animate-spin' : ''}`}>{isLoadingBranches ? 'progress_activity' : 'expand_more'}</span>
+                      </div>
+                    </div>
+
+                    {detectedFramework && (
+                      <div className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1c1b1d] border border-[#3c4a42] text-xs font-mono text-[#4cd7f6] shrink-0">
+                        <span className="material-symbols-outlined text-[16px]">auto_awesome</span>
+                        <span>{detectedFramework} detected</span>
+                      </div>
+                    )}
                   </div>
-                </div>
 
-                <div className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1c1b1d] border border-[#3c4a42] text-xs font-mono text-[#4cd7f6] shrink-0">
-                  <span className="material-symbols-outlined text-[16px]">auto_awesome</span>
-                  <span>Next.js 14 detected</span>
-                </div>
-              </div>
+                  {/* Environment Variables Panel */}
+                  <div className="mt-3 rounded-xl border border-[#3c4a42] overflow-hidden">
+                    <button
+                      onClick={() => setShowEnvVars(v => !v)}
+                      className="w-full flex items-center justify-between px-4 py-2.5 bg-[#0e0e10] hover:bg-[#1a1a1c] transition-colors text-xs text-[#bbcabf] cursor-pointer"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="material-symbols-outlined text-[16px] text-[#4cd7f6]">key</span>
+                        <span className="font-semibold text-[#e5e1e4]">Environment Variables</span>
+                        {envVars.filter(e => e.key.trim()).length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded-full bg-[#4cd7f6]/20 text-[#4cd7f6] text-[10px] font-bold">
+                            {envVars.filter(e => e.key.trim()).length}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[10px] text-[#bbcabf]">
 
-              <div className="flex items-center gap-3 shrink-0">
-                <button
-                  onClick={handleDeploy}
-                  disabled={isDeploying}
-                  className="w-full lg:w-auto px-5 py-2 rounded-lg bg-[#4edea3] text-[#003824] text-xs font-semibold flex items-center justify-center gap-2 hover:bg-[#6ffbbe] btn-glow-primary shadow-[0_0_20px_rgba(16,185,129,0.25)] active:scale-95 transition-all cursor-pointer"
-                >
-                  <span className={`material-symbols-outlined text-[18px] ${isDeploying ? 'animate-spin' : ''}`}>
-                    {isDeploying ? 'progress_activity' : 'bolt'}
-                  </span>
-                  <span>{isDeploying ? 'Deploying...' : 'Deploy to Production'}</span>
-                </button>
-              </div>
+                        <span className="material-symbols-outlined text-[14px]">{showEnvVars ? 'expand_less' : 'expand_more'}</span>
+                      </div>
+                    </button>
+
+                    {showEnvVars && (
+                      <div className="bg-[#131315] px-4 pt-3 pb-4 space-y-2">
+                        <p className="text-[10px] text-[#bbcabf] mb-3">
+                          These will be written to <code className="text-[#4cd7f6]">.env</code> in the project before it starts. Never commit secrets to git — add them here instead.
+                        </p>
+                        {envVars.map((ev, i) => (
+                          <div key={i} className="flex gap-2 items-center">
+                            <input
+                              type="text"
+                              value={ev.key}
+                              onChange={e => setEnvVars(prev => prev.map((p, j) => j === i ? { ...p, key: e.target.value } : p))}
+                              placeholder="KEY"
+                              className="flex-1 bg-[#0e0e10] border border-[#3c4a42] rounded-lg px-3 py-1.5 text-xs font-mono text-[#4cd7f6] placeholder:text-[#4c5a52] focus:outline-none focus:border-[#4cd7f6] uppercase"
+                            />
+                            <span className="text-[#bbcabf] text-xs">=</span>
+                            <input
+                              type="text"
+                              value={ev.value}
+                              onChange={e => setEnvVars(prev => prev.map((p, j) => j === i ? { ...p, value: e.target.value } : p))}
+                              placeholder="value"
+                              className="flex-[2] bg-[#0e0e10] border border-[#3c4a42] rounded-lg px-3 py-1.5 text-xs font-mono text-[#e5e1e4] placeholder:text-[#4c5a52] focus:outline-none focus:border-[#4cd7f6]"
+                            />
+                            <button
+                              onClick={() => setEnvVars(prev => prev.length === 1 ? [{ key: '', value: '' }] : prev.filter((_, j) => j !== i))}
+                              className="p-1.5 rounded-lg hover:bg-red-500/10 text-[#bbcabf] hover:text-red-400 transition-colors cursor-pointer"
+                            >
+                              <span className="material-symbols-outlined text-[16px]">close</span>
+                            </button>
+                          </div>
+                        ))}
+                        <div className="flex items-center gap-3 pt-1">
+                          <button
+                            onClick={() => setEnvVars(prev => [...prev, { key: '', value: '' }])}
+                            className="flex items-center gap-1.5 text-[11px] text-[#4edea3] hover:text-[#6ffbbe] transition-colors cursor-pointer"
+                          >
+                            <span className="material-symbols-outlined text-[14px]">add</span>
+                            Add variable
+                          </button>
+                          <span className="text-[#3c4a42]">·</span>
+                          <button
+                            onClick={() => {
+                              const text = prompt('Paste your .env contents here:');
+                              if (!text) return;
+                              const parsed = text.split('\n')
+                                .map(l => l.trim())
+                                .filter(l => l && !l.startsWith('#') && l.includes('='))
+                                .map(l => { const idx = l.indexOf('='); return { key: l.slice(0, idx).trim(), value: l.slice(idx + 1).trim().replace(/^["']|["']$/g, '') }; });
+                              if (parsed.length > 0) setEnvVars(parsed);
+                            }}
+                            className="flex items-center gap-1.5 text-[11px] text-[#bbcabf] hover:text-[#e5e1e4] transition-colors cursor-pointer"
+                          >
+                            <span className="material-symbols-outlined text-[14px]">content_paste</span>
+                            Paste .env file
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3 shrink-0 mt-3">
+                    <button
+                      onClick={handleDeploy}
+                      disabled={isDeploying}
+                      className="w-full lg:w-auto px-5 py-2 rounded-lg bg-[#4edea3] text-[#003824] text-xs font-semibold flex items-center justify-center gap-2 hover:bg-[#6ffbbe] btn-glow-primary shadow-[0_0_20px_rgba(16,185,129,0.25)] active:scale-95 transition-all cursor-pointer"
+                    >
+                      <span className={`material-symbols-outlined text-[18px] ${isDeploying ? 'animate-spin' : ''}`}>
+                        {isDeploying ? 'progress_activity' : 'bolt'}
+                      </span>
+                      <span>{isDeploying ? 'Deploying...' : 'Deploy to Production'}</span>
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </section>
 
@@ -621,84 +820,84 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               <div className="mt-1 text-[11px] text-[#bbcabf] font-mono">0 Degraded · 0 Restarting</div>
             </div>
 
-            {/* Global Edge Requests */}
+            {/* RAM Usage */}
             <div className="p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#4cd7f6]/40 tilt-card">
               <div className="flex items-center justify-between text-[#bbcabf] text-xs">
-                <span>Global Edge Requests</span>
-                <span className="material-symbols-outlined text-[#4cd7f6] text-[18px]">public</span>
+                <span>Memory Usage</span>
+                <span className="material-symbols-outlined text-[#4cd7f6] text-[18px]">memory</span>
               </div>
               <div className="mt-2 flex items-baseline gap-2">
-                <span className="text-2xl font-bold text-[#e5e1e4]">{services.length * 15}K</span>
-                <span className="font-mono text-xs text-[#4edea3] font-medium">+12.4%</span>
-              </div>
-              <div className="mt-1 text-[11px] text-[#bbcabf] font-mono">Trailing 24 hours · {services.length * 2} req/s</div>
-            </div>
-
-            {/* P99 Latency */}
-            <div className="p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#4edea3]/40 tilt-card">
-              <div className="flex items-center justify-between text-[#bbcabf] text-xs">
-                <span>P99 Latency</span>
-                <span className="material-symbols-outlined text-[#4edea3] text-[18px]">speed</span>
-              </div>
-              <div className="mt-2 flex items-baseline gap-2">
-                <span className="text-2xl font-bold text-[#e5e1e4]">38ms</span>
-                <span className="font-mono text-xs text-[#4edea3] font-medium">-4.2ms</span>
-              </div>
-              <div className="mt-1 text-[11px] text-[#bbcabf] font-mono">Global edge POPs worldwide</div>
-            </div>
-
-            {/* Monthly Bandwidth */}
-            <div className="p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#d0bcff]/40 tilt-card">
-              <div className="flex items-center justify-between text-[#bbcabf] text-xs">
-                <span>Monthly Bandwidth</span>
-                <span className="material-symbols-outlined text-[#d0bcff] text-[18px]">cloud_sync</span>
-              </div>
-              <div className="mt-2 flex items-baseline gap-2">
-                <span className="text-2xl font-bold text-[#e5e1e4]">{(services.length * 1.5).toFixed(1)} GB</span>
-                <span className="font-mono text-xs text-[#bbcabf]">/ 2 TB</span>
+                <span className="text-2xl font-bold text-[#e5e1e4]">{systemMetrics ? `${systemMetrics.memUsedMb} MB` : '...'}</span>
+                <span className="font-mono text-xs text-[#bbcabf]">/ {systemMetrics ? `${systemMetrics.memTotalMb} MB` : '...'}</span>
               </div>
               <div className="mt-2 w-full bg-[#2a2a2c] rounded-full h-1.5 overflow-hidden">
-                <div className="bg-[#4edea3] h-full rounded-full transition-all duration-1000" style={{ width: `${Math.min(100, (services.length * 1.5 / 2048) * 100)}%` }} />
+                <div className="bg-[#4cd7f6] h-full rounded-full transition-all duration-1000" style={{ width: systemMetrics ? `${(systemMetrics.memUsedMb / systemMetrics.memTotalMb * 100).toFixed(1)}%` : '0%' }} />
+              </div>
+            </div>
+
+            {/* CPU Usage */}
+            <div className="p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#4edea3]/40 tilt-card">
+              <div className="flex items-center justify-between text-[#bbcabf] text-xs">
+                <span>CPU Usage</span>
+                <span className="material-symbols-outlined text-[#4edea3] text-[18px]">developer_board</span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-bold text-[#e5e1e4]">{systemMetrics ? `${systemMetrics.cpuPercent}%` : '...'}</span>
+                <span className={`font-mono text-xs font-medium ${systemMetrics && systemMetrics.cpuPercent > 80 ? 'text-red-400' : 'text-[#4edea3]'}`}>{systemMetrics ? (systemMetrics.cpuPercent > 80 ? 'High' : 'Healthy') : ''}</span>
+              </div>
+              <div className="mt-2 w-full bg-[#2a2a2c] rounded-full h-1.5 overflow-hidden">
+                <div className={`h-full rounded-full transition-all duration-1000 ${systemMetrics && systemMetrics.cpuPercent > 80 ? 'bg-red-400' : 'bg-[#4edea3]'}`} style={{ width: systemMetrics ? `${systemMetrics.cpuPercent}%` : '0%' }} />
+              </div>
+            </div>
+
+            {/* Network Sent This Session */}
+            <div className="p-4 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#d0bcff]/40 tilt-card">
+              <div className="flex items-center justify-between text-[#bbcabf] text-xs">
+                <span>Network Sent (Session)</span>
+                <span className="material-symbols-outlined text-[#d0bcff] text-[18px]">data_usage</span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-bold text-[#e5e1e4]">{systemMetrics ? `${systemMetrics.bandwidthGb.toFixed(2)} GB` : '...'}</span>
+              </div>
+              <div className="mt-2 w-full bg-[#2a2a2c] rounded-full h-1.5 overflow-hidden">
+                <div className="bg-[#d0bcff] h-full rounded-full transition-all duration-1000" style={{ width: systemMetrics ? `${Math.min(systemMetrics.bandwidthGb / 50 * 100, 100).toFixed(1)}%` : '0%' }} />
               </div>
             </div>
           </section>
 
           {/* Active Workloads & Services */}
-          <section className="mt-8">
+          <section id="services-section" className="mt-8">
             <div className="flex items-center justify-between mb-3">
               <div>
-                <h2 className="text-lg text-[#e5e1e4] font-semibold">Active Workloads &amp; Services</h2>
-                <p className="text-xs text-[#bbcabf]">Production applications running on global container mesh.</p>
+                <h2 className="text-lg text-[#e5e1e4] font-semibold">Active Deployments</h2>
+                <p className="text-xs text-[#bbcabf]">Your currently deployed applications.</p>
               </div>
               <div className="flex items-center gap-2">
                 <span className="font-mono text-xs text-[#bbcabf]">Filter:</span>
                 <button
                   onClick={() => setFilter('all')}
-                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${
-                    filter === 'all'
+                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${filter === 'all'
                       ? 'bg-[#201f22] border border-[#4edea3]/30 text-[#4edea3]'
                       : 'text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#201f22]/60'
-                  }`}
+                    }`}
                 >
                   All ({services.length})
                 </button>
                 <button
                   onClick={() => setFilter('http')}
-                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${
-                    filter === 'http'
+                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${filter === 'http'
                       ? 'bg-[#201f22] border border-[#4edea3]/30 text-[#4edea3]'
                       : 'text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#201f22]/60'
-                  }`}
+                    }`}
                 >
                   HTTP ({services.filter((s) => s.kind === 'http').length})
                 </button>
                 <button
                   onClick={() => setFilter('workers')}
-                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${
-                    filter === 'workers'
+                  className={`px-2.5 py-1 text-xs font-mono rounded transition-all active:scale-95 ${filter === 'workers'
                       ? 'bg-[#201f22] border border-[#4edea3]/30 text-[#4edea3]'
                       : 'text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#201f22]/60'
-                  }`}
+                    }`}
                 >
                   Workers ({services.filter((s) => s.kind === 'workers').length})
                 </button>
@@ -808,13 +1007,6 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                       </code>
                     </p>
                   </div>
-                  <div className="text-right">
-                    <div className="text-[11px] text-[#bbcabf] font-mono">ESTIMATED COST</div>
-                    <div className="text-base font-mono font-bold text-[#4edea3]">
-                      ${calculatedCost}
-                      <span className="text-xs font-normal text-[#bbcabf]">/mo</span>
-                    </div>
-                  </div>
                 </div>
 
                 <div className="mt-5 space-y-4">
@@ -840,26 +1032,6 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                     </div>
                   </div>
 
-                  {/* CPU & Memory Specification Tiles */}
-                  <div className="grid grid-cols-2 gap-3 pt-2">
-                    <div className="p-3 bg-[#1c1b1d] border border-[#3c4a42] hover:border-[#4edea3]/30 rounded-lg transition-colors">
-                      <div className="text-[#bbcabf] text-[11px] font-mono">CPU COMPUTE</div>
-                      <div className="flex items-center justify-between mt-1">
-                        <span className="font-mono text-base font-bold text-[#e5e1e4]">{vcpuValue} vCPU</span>
-                        <span className="material-symbols-outlined text-[#86948a] text-[18px]">memory</span>
-                      </div>
-                      <div className="text-[11px] text-[#4edea3] font-mono mt-1">Burst up to 2.4 GHz</div>
-                    </div>
-
-                    <div className="p-3 bg-[#1c1b1d] border border-[#3c4a42] hover:border-[#4cd7f6]/30 rounded-lg transition-colors">
-                      <div className="text-[#bbcabf] text-[11px] font-mono">DEDICATED RAM</div>
-                      <div className="flex items-center justify-between mt-1">
-                        <span className="font-mono text-base font-bold text-[#e5e1e4]">{ramValue} MB</span>
-                        <span className="material-symbols-outlined text-[#86948a] text-[18px]">storage</span>
-                      </div>
-                      <div className="text-[11px] text-[#4cd7f6] font-mono mt-1">DDR5 ECC Cached</div>
-                    </div>
-                  </div>
 
                   {/* Status Badges */}
                   <div className="p-3 bg-[#1c1b1d] border border-[#3c4a42] rounded-lg space-y-2">
@@ -870,15 +1042,6 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                       </div>
                       <span className="text-[11px] font-mono text-[#4edea3] px-2 py-0.5 rounded bg-[#4edea3]/10 border border-[#4edea3]/20">
                         ENABLED
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="material-symbols-outlined text-[#4cd7f6] text-[18px]">shield</span>
-                        <span className="text-xs text-[#e5e1e4] font-medium">Cross-Zone Multi-Region Failover</span>
-                      </div>
-                      <span className="text-[11px] font-mono text-[#4cd7f6] px-2 py-0.5 rounded bg-[#4cd7f6]/10 border border-[#4cd7f6]/20">
-                        ACTIVE
                       </span>
                     </div>
                   </div>
@@ -1009,31 +1172,28 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                 <div className="flex items-center space-x-1">
                   <button
                     onClick={() => setActiveLogTab('build')}
-                    className={`px-3 py-1 font-mono text-xs transition-colors ${
-                      activeLogTab === 'build'
+                    className={`px-3 py-1 font-mono text-xs transition-colors ${activeLogTab === 'build'
                         ? 'bg-[#1c1b1d] text-[#4edea3] border-b-2 border-[#4edea3] font-medium'
                         : 'text-[#bbcabf] hover:text-[#e5e1e4]'
-                    }`}
+                      }`}
                   >
                     Build Logs
                   </button>
                   <button
                     onClick={() => setActiveLogTab('runtime')}
-                    className={`px-3 py-1 font-mono text-xs transition-colors ${
-                      activeLogTab === 'runtime'
+                    className={`px-3 py-1 font-mono text-xs transition-colors ${activeLogTab === 'runtime'
                         ? 'bg-[#1c1b1d] text-[#4edea3] border-b-2 border-[#4edea3] font-medium'
                         : 'text-[#bbcabf] hover:text-[#e5e1e4]'
-                    }`}
+                      }`}
                   >
                     Runtime Output
                   </button>
                   <button
                     onClick={() => setActiveLogTab('access')}
-                    className={`px-3 py-1 font-mono text-xs transition-colors ${
-                      activeLogTab === 'access'
+                    className={`px-3 py-1 font-mono text-xs transition-colors ${activeLogTab === 'access'
                         ? 'bg-[#1c1b1d] text-[#4edea3] border-b-2 border-[#4edea3] font-medium'
                         : 'text-[#bbcabf] hover:text-[#e5e1e4]'
-                    }`}
+                      }`}
                   >
                     HTTP Access Stream
                   </button>
@@ -1057,9 +1217,8 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   />
                   <button
                     onClick={() => setAutoScroll(!autoScroll)}
-                    className={`px-2 py-1 bg-[#1c1b1d] border border-[#3c4a42] rounded font-mono text-xs flex items-center gap-1 active:scale-95 transition-transform ${
-                      autoScroll ? 'text-[#4edea3]' : 'text-[#86948a]'
-                    }`}
+                    className={`px-2 py-1 bg-[#1c1b1d] border border-[#3c4a42] rounded font-mono text-xs flex items-center gap-1 active:scale-95 transition-transform ${autoScroll ? 'text-[#4edea3]' : 'text-[#86948a]'
+                      }`}
                   >
                     <span className="material-symbols-outlined text-[14px]">vertical_align_bottom</span>
                     <span>Auto-scroll</span>
@@ -1087,19 +1246,18 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   <div key={idx} className="flex items-start gap-2">
                     <span className="text-[#86948a] shrink-0">[{log.timestamp}]</span>
                     <span
-                      className={`font-semibold shrink-0 ${
-                        log.level === 'INFO'
+                      className={`font-semibold shrink-0 ${log.level === 'INFO'
                           ? 'text-[#4cd7f6]'
                           : log.level === 'BUILD'
-                          ? 'text-[#4edea3]'
-                          : log.level === 'SUCCESS'
-                          ? 'text-[#4edea3]'
-                          : log.level === 'ROUTING'
-                          ? 'text-[#4edea3]'
-                          : log.level === 'RUN'
-                          ? 'text-[#4edea3]'
-                          : 'text-[#d0bcff]'
-                      }`}
+                            ? 'text-[#4edea3]'
+                            : log.level === 'SUCCESS'
+                              ? 'text-[#4edea3]'
+                              : log.level === 'ROUTING'
+                                ? 'text-[#4edea3]'
+                                : log.level === 'RUN'
+                                  ? 'text-[#4edea3]'
+                                  : 'text-[#d0bcff]'
+                        }`}
                     >
                       {log.level}
                     </span>
@@ -1107,14 +1265,21 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   </div>
                 ))
               )}
-              <div className="flex items-center gap-2 pt-1 border-t border-[#3c4a42]/40 mt-2 text-[#86948a]">
-                <span className="text-[#4edea3] font-bold">✓ Deployment complete.</span>
-                <span className="text-[#e5e1e4]">Available at:</span>
-                <a href="https://api.cloudscale.io" className="text-[#4cd7f6] hover:underline">
-                  https://api.cloudscale.io
-                </a>
-                <span className="text-[11px]">(Latency: 38ms from Frankfurt edge)</span>
-              </div>
+              {services.length > 0 && (
+                <div className="flex items-center gap-2 pt-1 border-t border-[#3c4a42]/40 mt-2 text-[#86948a] flex-wrap">
+                  <span className="text-[#4edea3] font-bold">✓ Deployment complete.</span>
+                  <span className="text-[#e5e1e4]">Available at:</span>
+                  <a
+                    href={services[0].endpoint}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[#4cd7f6] hover:underline font-mono"
+                  >
+                    {services[0].endpoint}
+                  </a>
+                  <span className="text-[11px] text-[#86948a]">({services[0].region || 'local-edge'})</span>
+                </div>
+              )}
             </div>
           </section>
 

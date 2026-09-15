@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev:ui": "vite --port=3000 --host=0.0.0.0",
-    "dev:server": "tsx server.ts",
+    "dev:server": "tsx watch server.ts",
     "dev": "concurrently \"npm run dev:ui\" \"npm run dev:server\"",
     "build": "vite build",
     "preview": "vite preview",
