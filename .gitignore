@@ -9,3 +9,5 @@ coverage/
 
 .deployments/
 deployments.db
+*.db
+*.cjs

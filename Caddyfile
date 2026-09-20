@@ -1,0 +1,20 @@
+{
+  admin 0.0.0.0:2019
+}
+
+# Fallback for CloudScale Dashboard
+:8000 {
+  reverse_proxy localhost:8000
+}
+
+the805.localhost:8000 {
+  reverse_proxy localhost:4010
+}
+
+nipun.runs-on.dev {
+  reverse_proxy localhost:4010
+}
+
+atsebol.nipun.runs-on.dev {
+  reverse_proxy localhost:4010
+}

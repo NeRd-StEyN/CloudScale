@@ -3,8 +3,8 @@ export type ScreenMode = 'landing' | 'console';
 export interface ServiceWorkload {
   id: string;
   name: string;
-  kind: 'http' | 'workers';
-  status: 'healthy' | 'degraded' | 'deploying';
+  kind: 'http' | 'worker';
+  status: 'healthy' | 'degraded' | 'deploying' | 'failed' | 'deleted';
   environment: string;
   region: string;
   commitHash: string;
@@ -15,6 +15,7 @@ export interface ServiceWorkload {
   domains?: string[];
   icon: string;
   iconColor: string;
+  framework?: string;
 }
 
 export interface PopNode {

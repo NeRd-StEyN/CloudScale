@@ -36,11 +36,22 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
       }
     } catch (err: any) {
       console.error('Failed to connect GitHub:', err);
-      alert('Failed to connect GitHub: ' + (err.errors?.[0]?.message || err.message || 'Unknown error'));
+      showToast('Failed to connect GitHub: ' + (err.errors?.[0]?.message || err.message || 'Unknown error'));
     }
   };
 
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{ id: string, name: string } | null>(null);
+  const [showEnvPasteModal, setShowEnvPasteModal] = useState<boolean>(false);
+  const [envPasteContent, setEnvPasteContent] = useState<string>('');
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const showToast = (message: string) => {
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(null), 3000);
+  };
   const [services, setServices] = useState<ServiceWorkload[]>([]);
+  const [databases, setDatabases] = useState<any[]>([]);
+  const [dbTargetServiceId, setDbTargetServiceId] = useState<string>('');
+  const [isProvisioningDb, setIsProvisioningDb] = useState<boolean>(false);
   const [filter, setFilter] = useState<'all' | 'http' | 'workers'>('all');
   const [activeNav, setActiveNav] = useState<string>('Overview');
   const [selectedVpc, setSelectedVpc] = useState<string>('prod-primary-vpc');
@@ -85,42 +96,68 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
     }
   }, [logs, autoScroll]);
 
-  useEffect(() => {
-    const fetchServices = async () => {
-      try {
-        const token = await getToken();
-        if (!token) return;
-        const res = await fetch('/api/services', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        if (res.ok) {
-          const data = await res.json();
-          // Transform db format to UI format
-          setServices(data.services.map((s: any) => ({
-            id: s.id,
-            name: s.repoUrl.split('/').pop()?.replace('.git', '') || s.id,
-            kind: 'http',
-            status: s.status === 'active' ? 'healthy' : s.status,
-            environment: 'Production',
-            region: 'local-edge',
-            commitHash: 'latest',
-            branch: 'main',
-            replicas: 1,
-            replicasSummary: '1 Replica',
-            endpoint: `http://${s.id}.localhost:8000`,
-            domains: [`${s.id}.localhost`],
-            icon: 'rocket_launch',
-            iconColor: 'text-[#4edea3]',
-          })));
-        }
-      } catch (e) {
-        console.error("Failed to fetch services", e);
+  // ─── Services fetch helper (shared between load + sync) ───────────────────
+  const fetchDatabases = React.useCallback(async () => {
+    try {
+      const token = await getToken();
+      const res = await fetch('/api/databases', { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) {
+        const data = await res.json();
+        setDatabases(data.databases || []);
       }
-    };
-    if (isSignedIn) {
-      fetchServices();
+    } catch (err) {}
+  }, [getToken]);
+
+  const fetchServices = React.useCallback(async () => {
+    try {
+      const token = await getToken();
+      if (!token) return;
+      const res = await fetch('/api/services', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const activeServices = data.services.filter((s: any) => s.status !== 'deleted');
+        setServices(activeServices.map((s: any) => {
+            const isWorker = s.kind === 'worker';
+            const baseDomain = window.location.hostname === 'localhost'
+              ? `${s.id}.localhost:8000`
+              : `${s.id}.${window.location.hostname}`;
+            return {
+              id: s.id,
+              name: s.repoUrl.split('/').pop()?.replace('.git', '') || s.id,
+              kind: isWorker ? 'worker' : 'http',
+              status: s.status === 'active' ? 'healthy' : s.status,
+              environment: 'Production',
+              region: 'local-edge',
+              commitHash: 'latest',
+              branch: s.branch || 'main',
+              replicas: s.replicas || 1,
+              replicasSummary: isWorker ? 'Worker' : `${s.replicas || 1} Replica${s.replicas > 1 ? 's' : ''}`,
+              endpoint: isWorker ? undefined : `http://${baseDomain}`,
+              domains: isWorker ? [] : [`${s.id}.localhost`],
+              icon: isWorker ? 'memory' : 'rocket_launch',
+              iconColor: isWorker ? 'text-yellow-400' : 'text-[#4edea3]',
+              framework: s.framework || undefined,
+              customDomains: s.customDomains || []
+            };
+          })
+        );
+        
+        const allDomains = activeServices.flatMap((s: any) => s.customDomains || []);
+        setDomains(allDomains);
+      }
+    } catch (e) {
+      console.error('Failed to fetch services', e);
     }
-  }, [isSignedIn, getToken]);
+  }, [getToken]);
+
+  useEffect(() => {
+    if (isSignedIn) fetchServices();
+    // Auto-refresh every 15s to catch in-progress deployments
+    const interval = setInterval(() => { if (isSignedIn) fetchServices(); }, 15000);
+    return () => clearInterval(interval);
+  }, [isSignedIn, fetchServices]);
 
   useEffect(() => {
     const fetchRepos = async () => {
@@ -216,20 +253,15 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
     return () => clearInterval(interval);
   }, []);
 
-  const handleSyncCluster = () => {
+  const handleSyncCluster = async () => {
     setIsSyncing(true);
-    setTimeout(() => {
-      setIsSyncing(false);
-      const now = new Date().toTimeString().split(' ')[0];
-      setLogs((prev) => [
-        ...prev,
-        {
-          timestamp: `${now}.104`,
-          level: 'INFO',
-          message: 'Cluster state verified: All 8 microVM nodes synchronized across AWS & GCP edge zones.',
-        },
-      ]);
-    }, 900);
+    await fetchServices();
+    setIsSyncing(false);
+    const now = new Date().toTimeString().split(' ')[0];
+    setLogs(prev => [
+      ...prev,
+      { timestamp: now, level: 'INFO', message: `Services refreshed: ${services.length} deployment(s) loaded from server.` },
+    ]);
   };
 
   const handleDeploy = async () => {
@@ -257,51 +289,45 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
         throw new Error(data.error || 'Deploy failed');
       }
 
-      // Poll for logs
+      // Poll for logs + completion status
       const interval = setInterval(async () => {
         try {
-          const token = await getToken();
+          const t = await getToken();
           const logRes = await fetch(`/api/logs/${data.id}`, {
-            headers: { 'Authorization': `Bearer ${token}` }
+            headers: { 'Authorization': `Bearer ${t}` }
           });
           if (logRes.ok) {
             const logData = await logRes.json();
+            const now = new Date().toTimeString().split(' ')[0];
             const newLogs = logData.logs.map((msg: string, i: number) => ({
-              timestamp: new Date().toTimeString().split(' ')[0] + `.${String(i).padStart(3, '0')}`,
-              level: msg.includes('Error') || msg.includes('failed') ? 'ERROR' : 'INFO',
+              timestamp: `${now}.${String(i).padStart(3, '0')}`,
+              level: msg.startsWith('❌') ? 'ERROR'
+                : msg.startsWith('✅') ? 'SUCCESS'
+                : msg.startsWith('🔨') || msg.startsWith('📦') ? 'BUILD'
+                : msg.startsWith('🚀') ? 'RUN'
+                : 'INFO',
               message: msg
             }));
             setLogs(newLogs);
 
-            if (newLogs.some((l: any) => l.message.includes('Deployment active at') || l.message.includes('failed'))) {
+            // Detect terminal states
+            const isDone = logData.logs.some((m: string) =>
+              m.includes('Deployment live at') ||
+              m.includes('Worker is running') ||
+              m.includes('failed') ||
+              m.includes('❌')
+            );
+            if (isDone) {
               clearInterval(interval);
               setIsDeploying(false);
-
-              if (newLogs.some((l: any) => l.message.includes('Deployment active at'))) {
-                const newS: ServiceWorkload = {
-                  id: data.id,
-                  name: deployRepoUrl.split('/').pop()?.replace('.git', '') || data.id,
-                  kind: 'http',
-                  status: 'healthy',
-                  environment: 'Production',
-                  region: 'local-edge',
-                  commitHash: 'latest',
-                  branch: deployBranch,
-                  replicas: 1,
-                  replicasSummary: '1 Replica',
-                  endpoint: data.url,
-                  domains: [`${data.id}.localhost`],
-                  icon: 'rocket_launch',
-                  iconColor: 'text-[#4edea3]',
-                };
-                setServices((prev) => [newS, ...prev]);
-              }
+              // Refresh the full services list from server (gets real kind/framework)
+              await fetchServices();
             }
           }
-        } catch (e) {
-          // ignore network errors while polling
+        } catch {
+          // ignore transient network errors while polling
         }
-      }, 1000);
+      }, 1500);
 
     } catch (err: any) {
       setLogs((prev) => [
@@ -316,56 +342,114 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
     }
   };
 
-  const handleApplyScaling = () => {
-    setIsScalingApplied(true);
-    setServices((prev) =>
-      prev.map((s) =>
-        s.id === targetServiceId
-          ? {
-            ...s,
-            replicas: replicaCount,
-            replicasSummary: `${replicaCount} Replicas`,
-          }
-          : s,
-      ),
-    );
-    const now = new Date().toTimeString().split(' ')[0];
-    setLogs((prev) => [
-      ...prev,
-      {
-        timestamp: `${now}.230`,
-        level: 'RUN',
-        message: `Replica scaling applied: target=${services.find((s) => s.id === targetServiceId)?.name
-          } count=${replicaCount} (${(replicaCount * 0.25).toFixed(1)} vCPU, ${replicaCount * 512} MB RAM)`,
-      },
-    ]);
-    setTimeout(() => setIsScalingApplied(false), 1500);
+  const handleDeleteDeployment = async (serviceId: string, serviceName: string) => {
+    setDeleteConfirmation({ id: serviceId, name: serviceName });
+  };
+  
+  const confirmDeleteDeployment = async () => {
+    if (!deleteConfirmation) return;
+    const { id: serviceId, name: serviceName } = deleteConfirmation;
+    setDeleteConfirmation(null);
+    try {
+      const token = await getToken();
+      const res = await fetch(`/api/deploy/${serviceId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setServices(prev => prev.filter(s => s.id !== serviceId));
+        const now = new Date().toTimeString().split(' ')[0];
+        setLogs(prev => [
+          ...prev,
+          { timestamp: now, level: 'INFO', message: `Deployment '${serviceName}' deleted successfully.` },
+        ]);
+      } else {
+        const data = await res.json();
+        showToast(`Failed to delete: ${data.error}`);
+      }
+    } catch (err: any) {
+      showToast(`Error: ${err.message}`);
+    }
   };
 
-  const handleAddDomain = (e: React.FormEvent) => {
+  const handleApplyScaling = async () => {
+    if (!targetServiceId || targetServiceId === 's1') {
+      showToast("Please select a target workload first");
+      return;
+    }
+    setIsScalingApplied(true);
+    try {
+      const token = await getToken();
+      const res = await fetch(`/api/deploy/${targetServiceId}/scale`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ replicas: replicaCount })
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to scale');
+      }
+      
+      setServices((prev) =>
+        prev.map((s) =>
+          s.id === targetServiceId
+            ? {
+              ...s,
+              replicas: replicaCount,
+              replicasSummary: `${replicaCount} Replica${replicaCount > 1 ? 's' : ''}`,
+            }
+            : s,
+        ),
+      );
+      const now = new Date().toTimeString().split(' ')[0];
+      setLogs((prev) => [
+        ...prev,
+        {
+          timestamp: `${now}.230`,
+          level: 'RUN',
+          message: `Replica scaling applied: target=${services.find((s) => s.id === targetServiceId)?.name} count=${replicaCount} (${(replicaCount * 0.25).toFixed(1)} vCPU, ${replicaCount * 512} MB RAM)`,
+        },
+      ]);
+    } catch (e: any) {
+      showToast(`Scaling failed: ${e.message}`);
+    } finally {
+      setTimeout(() => setIsScalingApplied(false), 1500);
+    }
+  };
+
+  const handleAddDomain = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newDomainName.trim()) return;
-    const item: DomainItem = {
-      id: `d_${Date.now()}`,
-      domain: newDomainName.trim(),
-      target: newDomainTarget,
-      sslStatus: 'SSL Active',
-      provider: "Let's Encrypt Wildcard • HTTP/3",
-      autoRenew: true,
-    };
-    setDomains((prev) => [...prev, item]);
-    setNewDomainName('');
-    setShowAddDomainModal(false);
+    if (!newDomainName.trim() || !newDomainTarget) return;
+    try {
+      const token = await getToken();
+      const res = await fetch(`/api/deploy/${newDomainTarget}/domains`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ domain: newDomainName.trim() })
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to add domain');
+      }
+      
+      await fetchServices(); // refresh list to get new domains
+      setNewDomainName('');
+      setNewDomainTarget('');
+      setShowAddDomainModal(false);
+    } catch (e: any) {
+      showToast(`Domain mapping failed: ${e.message}`);
+    }
   };
 
   const filteredServices = services.filter((s) => {
     if (filter === 'http') return s.kind === 'http';
-    if (filter === 'workers') return s.kind === 'workers';
+    if (filter === 'workers') return s.kind === 'worker';
     return true;
   }).filter((s) => {
     if (!globalSearch.trim()) return true;
     return s.name.toLowerCase().includes(globalSearch.toLowerCase()) ||
-      s.region.toLowerCase().includes(globalSearch.toLowerCase());
+      s.region.toLowerCase().includes(globalSearch.toLowerCase()) ||
+      (s.framework || '').toLowerCase().includes(globalSearch.toLowerCase());
   });
 
   const filteredLogs = logs.filter((log) => {
@@ -409,13 +493,13 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               Docs
             </button>
             <button
-              onClick={() => alert('Support portal: Connected to 24/7 dedicated enterprise infrastructure team.')}
+              onClick={() => showToast('Support portal: Connected to 24/7 dedicated enterprise infrastructure team.')}
               className="text-sm text-[#bbcabf] hover:text-[#e5e1e4] transition-colors"
             >
               Support
             </button>
             <button
-              onClick={() => alert('Changelog: v2.4.0 active with Anycast mesh routing and Firecracker v2.')}
+              onClick={() => showToast('Changelog: v2.4.0 active with Anycast mesh routing and Firecracker v2.')}
               className="text-sm text-[#bbcabf] hover:text-[#e5e1e4] transition-colors"
             >
               Changelog
@@ -436,14 +520,14 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
           {/* Quick Action Icons */}
           <div className="flex items-center space-x-1">
             <button
-              onClick={() => alert('No active alerts.')}
+              onClick={() => showToast('No active alerts.')}
               className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
               title="Notifications"
             >
               <span className="material-symbols-outlined text-[18px]">notifications</span>
             </button>
             <button
-              onClick={() => alert('Help: Docs, API specs, and CLI instructions available in sidebar.')}
+              onClick={() => showToast('Help: Docs, API specs, and CLI instructions available in sidebar.')}
               className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
               title="Help"
             >
@@ -523,14 +607,14 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
           {/* Sidebar Footer */}
           <div className="pt-4 border-t border-[#3c4a42] space-y-1">
             <button
-              onClick={() => alert('CloudScale Documentation v2.4')}
+              onClick={() => showToast('CloudScale Documentation v2.4')}
               className="w-full flex items-center gap-3 px-3 py-2 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#1c1b1d] text-xs rounded-lg transition-colors text-left"
             >
               <span className="material-symbols-outlined text-[18px]">menu_book</span>
               <span>Documentation</span>
             </button>
             <button
-              onClick={() => alert('All edge PoPs operational (SLA: 99.999%).')}
+              onClick={() => showToast('All edge PoPs operational (SLA: 99.999%).')}
               className="w-full flex items-center justify-between px-3 py-2 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#1c1b1d] text-xs rounded-lg transition-colors text-left"
             >
               <div className="flex items-center gap-3">
@@ -766,15 +850,7 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                           </button>
                           <span className="text-[#3c4a42]">·</span>
                           <button
-                            onClick={() => {
-                              const text = prompt('Paste your .env contents here:');
-                              if (!text) return;
-                              const parsed = text.split('\n')
-                                .map(l => l.trim())
-                                .filter(l => l && !l.startsWith('#') && l.includes('='))
-                                .map(l => { const idx = l.indexOf('='); return { key: l.slice(0, idx).trim(), value: l.slice(idx + 1).trim().replace(/^["']|["']$/g, '') }; });
-                              if (parsed.length > 0) setEnvVars(parsed);
-                            }}
+                            onClick={() => setShowEnvPasteModal(true)}
                             className="flex items-center gap-1.5 text-[11px] text-[#bbcabf] hover:text-[#e5e1e4] transition-colors cursor-pointer"
                           >
                             <span className="material-symbols-outlined text-[14px]">content_paste</span>
@@ -817,7 +893,10 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   Active
                 </span>
               </div>
-              <div className="mt-1 text-[11px] text-[#bbcabf] font-mono">0 Degraded · 0 Restarting</div>
+              <div className="mt-1 text-[11px] text-[#bbcabf] font-mono">
+                {services.filter(s => s.status === 'degraded' || s.status === 'failed').length} Failed
+                · {services.filter(s => s.status === 'deploying').length} Deploying
+              </div>
             </div>
 
             {/* RAM Usage */}
@@ -917,10 +996,34 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                     <div>
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-sm font-semibold text-[#e5e1e4]">{service.name}</span>
-                        <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-[#4edea3]/10 border border-[#4edea3]/30 text-[#4edea3] flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#4edea3] animate-pulse-glow" />
-                          Healthy
-                        </span>
+                        {/* Framework badge */}
+                        {service.framework && (
+                          <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-[#2a2a2c] text-[#bbcabf] border border-[#3c4a42]">
+                            {service.framework}
+                          </span>
+                        )}
+                        {/* Kind badge: Worker vs Active/Deploying/Failed */}
+                        {service.kind === 'worker' ? (
+                          <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-yellow-400/10 border border-yellow-400/30 text-yellow-400 flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+                            Worker
+                          </span>
+                        ) : (
+                          <span className={`px-2 py-0.5 rounded text-[11px] font-mono flex items-center gap-1.5 ${
+                            service.status === 'healthy'
+                              ? 'bg-[#4edea3]/10 border border-[#4edea3]/30 text-[#4edea3]'
+                              : service.status === 'deploying'
+                              ? 'bg-yellow-400/10 border border-yellow-400/30 text-yellow-400'
+                              : 'bg-red-400/10 border border-red-400/30 text-red-400'
+                          }`}>
+                            <span className={`w-1.5 h-1.5 rounded-full ${
+                              service.status === 'healthy' ? 'bg-[#4edea3] animate-pulse-glow'
+                              : service.status === 'deploying' ? 'bg-yellow-400 animate-pulse'
+                              : 'bg-red-400'
+                            }`} />
+                            {service.status === 'healthy' ? 'Active' : service.status === 'deploying' ? 'Deploying...' : service.status}
+                          </span>
+                        )}
                         <span className="text-xs text-[#bbcabf]">{service.environment}</span>
                         <span className="text-[#bbcabf]">•</span>
                         <span className="text-xs text-[#bbcabf]">{service.region}</span>
@@ -928,11 +1031,12 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                       <div className="mt-1 flex items-center gap-3 font-mono text-xs text-[#bbcabf] flex-wrap">
                         <span className="flex items-center gap-1 text-[#86948a]">
                           <span className="material-symbols-outlined text-[14px]">commit</span>
-                          {service.branch}@{service.commitHash}
+                          {service.branch}@latest
                         </span>
                         <span>•</span>
                         <span className="text-[#4cd7f6] font-medium">{service.replicasSummary}</span>
-                        {service.endpoint && (
+                        {/* Only show URL link for HTTP services */}
+                        {service.kind === 'http' && service.endpoint ? (
                           <>
                             <span>•</span>
                             <a
@@ -941,11 +1045,16 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                               rel="noreferrer"
                               className="text-[#bbcabf] hover:text-[#4cd7f6] flex items-center gap-1 underline underline-offset-2 transition-colors"
                             >
-                              {service.endpoint.replace('https://', '')}
+                              {service.endpoint.replace('http://', '')}
                               <span className="material-symbols-outlined text-[13px]">open_in_new</span>
                             </a>
                           </>
-                        )}
+                        ) : service.kind === 'worker' ? (
+                          <>
+                            <span>•</span>
+                            <span className="text-yellow-400/70">Background process — no public URL</span>
+                          </>
+                        ) : null}
                       </div>
                     </div>
                   </div>
@@ -968,21 +1077,97 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                         const el = document.getElementById('replica-scaling-section');
                         el?.scrollIntoView({ behavior: 'smooth' });
                       }}
-                      className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
-                      title="Scale Replicas"
+                      className={`p-1.5 hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors ${
+                        service.kind === 'worker' ? 'text-[#3c4a42] cursor-not-allowed' : 'text-[#bbcabf]'
+                      }`}
+                      title={service.kind === 'worker' ? 'Replica scaling not available for workers' : 'Scale Replicas'}
+                      disabled={service.kind === 'worker'}
                     >
                       <span className="material-symbols-outlined text-[18px]">tune</span>
                     </button>
                     <button
-                      onClick={() => alert(`Settings for ${service.name}: All environment secrets and build args intact.`)}
+                      onClick={() => showToast(`Settings for ${service.name}: All environment secrets and build args intact.`)}
                       className="p-1.5 text-[#bbcabf] hover:text-[#e5e1e4] hover:bg-[#2a2a2c] rounded transition-colors"
                       title="Settings"
                     >
                       <span className="material-symbols-outlined text-[18px]">more_vert</span>
                     </button>
+                    <button
+                      onClick={() => handleDeleteDeployment(service.id, service.name)}
+                      className="p-1.5 text-[#bbcabf] hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                      title="Delete Deployment"
+                    >
+                      <span className="material-symbols-outlined text-[18px]">delete</span>
+                    </button>
                   </div>
                 </div>
               ))}
+            </div>
+          </section>
+
+                    {/* Managed Databases */}
+          <section id="databases-section" className="mt-8 p-5 rounded-xl bg-[#131315]/90 backdrop-blur-md border border-[#3c4a42] hover:border-[#4cd7f6]/30 shadow-xl tilt-card">
+            <div className="flex items-center justify-between pb-3 border-b border-[#3c4a42] mb-4">
+              <div>
+                <h3 className="text-base text-[#e5e1e4] font-semibold flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[#4cd7f6]">database</span>
+                  Managed Databases
+                </h3>
+                <p className="text-xs text-[#bbcabf] mt-1">Spin up isolated Postgres or Redis containers, automatically injected into your deployments via Env Vars.</p>
+              </div>
+            </div>
+
+            <div className="flex flex-col md:flex-row gap-6 mb-6">
+              <div className="flex-1">
+                <label className="block text-xs font-semibold text-[#e5e1e4] mb-1">Target Deployment</label>
+                <select 
+                  value={dbTargetServiceId} 
+                  onChange={(e) => setDbTargetServiceId(e.target.value)}
+                  className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg px-3 py-2 text-xs font-mono text-[#e5e1e4] focus:outline-none focus:border-[#4cd7f6]"
+                >
+                  <option value="">-- Select Deployment --</option>
+                  {services.map(s => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}
+                </select>
+              </div>
+              <div className="flex gap-3 items-end">
+                <button
+                  onClick={() => handleCreateDatabase('postgres')}
+                  disabled={isProvisioningDb}
+                  className="px-4 py-2 bg-[#4cd7f6]/10 border border-[#4cd7f6]/30 text-[#4cd7f6] hover:bg-[#4cd7f6]/20 font-semibold text-xs rounded-lg transition-all flex items-center gap-2 disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[16px]">storage</span>
+                  Postgres
+                </button>
+                <button
+                  onClick={() => handleCreateDatabase('redis')}
+                  disabled={isProvisioningDb}
+                  className="px-4 py-2 bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 font-semibold text-xs rounded-lg transition-all flex items-center gap-2 disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[16px]">memory</span>
+                  Redis
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {databases.map(db => (
+                <div key={db.id} className="p-3 border border-[#3c4a42] bg-[#1c1b1d] rounded-lg relative group">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className={`material-symbols-outlined text-[18px] ${db.type === 'postgres' ? 'text-[#4cd7f6]' : 'text-red-400'}`}>
+                      {db.type === 'postgres' ? 'storage' : 'memory'}
+                    </span>
+                    <span className="font-semibold text-sm text-[#e5e1e4] capitalize">{db.type} Container</span>
+                  </div>
+                  <div className="text-xs text-[#bbcabf] font-mono break-all bg-[#0e0e10] p-2 rounded">
+                    {db.connectionString.replace(/:[^:@]+@/, ':••••••@')}
+                  </div>
+                  <div className="text-[11px] text-[#bbcabf] mt-2 flex justify-between items-center">
+                    <span>Linked to: <span className="font-mono text-[#e5e1e4]">{db.repoUrl.split('/').pop()}</span></span>
+                    <span className="px-1.5 py-0.5 bg-[#4edea3]/10 text-[#4edea3] rounded border border-[#4edea3]/30">Running</span>
+                  </div>
+                </div>
+              ))}
+              {databases.length === 0 && <div className="text-xs text-[#bbcabf] italic col-span-2">No databases provisioned yet.</div>}
             </div>
           </section>
 
@@ -1000,11 +1185,22 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                       <span className="material-symbols-outlined text-[#4edea3]">tune</span>
                       Replica Scaling &amp; Allocation
                     </h3>
-                    <p className="text-xs text-[#bbcabf]">
+                    <p className="text-xs text-[#bbcabf] flex items-center mt-1">
                       Target workload:{' '}
-                      <code className="text-[#4edea3] font-mono">
-                        {services.find((s) => s.id === targetServiceId)?.name || 'api-gateway'}
-                      </code>
+                      <select 
+                        value={targetServiceId} 
+                        onChange={(e) => {
+                          setTargetServiceId(e.target.value);
+                          const s = services.find(x => x.id === e.target.value);
+                          if (s) setReplicaCount(s.replicas || 1);
+                        }}
+                        className="bg-[#1c1b1d] border border-[#3c4a42] rounded px-2 py-1 text-xs font-mono text-[#4edea3] focus:outline-none ml-2 w-48 truncate cursor-pointer"
+                      >
+                        <option value="s1" disabled>-- Select a deployment --</option>
+                        {services.filter(s => s.status === 'healthy').map(s => (
+                          <option key={s.id} value={s.id}>{s.name} ({s.id})</option>
+                        ))}
+                      </select>
                     </p>
                   </div>
                 </div>
@@ -1033,17 +1229,20 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   </div>
 
 
-                  {/* Status Badges */}
+                  {/* Status Info */}
                   <div className="p-3 bg-[#1c1b1d] border border-[#3c4a42] rounded-lg space-y-2">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
-                        <span className="material-symbols-outlined text-[#4edea3] text-[18px]">verified</span>
-                        <span className="text-xs text-[#e5e1e4] font-medium">Zero-Downtime Rolling Updates</span>
+                        <span className="material-symbols-outlined text-[#4cd7f6] text-[18px]">info</span>
+                        <span className="text-xs text-[#e5e1e4] font-medium">Single-node mode</span>
                       </div>
-                      <span className="text-[11px] font-mono text-[#4edea3] px-2 py-0.5 rounded bg-[#4edea3]/10 border border-[#4edea3]/20">
-                        ENABLED
+                      <span className="text-[11px] font-mono text-[#bbcabf] px-2 py-0.5 rounded bg-[#2a2a2c] border border-[#3c4a42]">
+                        Simulated
                       </span>
                     </div>
+                    <p className="text-[11px] text-[#86948a] leading-relaxed">
+                      Replica scaling is simulated on single-node deployments. For true horizontal scaling, use Docker Swarm or Kubernetes in production.
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1145,12 +1344,12 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               </div>
 
               <div className="mt-4 pt-3 border-t border-[#3c4a42] flex items-center justify-between text-xs text-[#bbcabf]">
-                <span>{domains.length} of 10 custom domains utilized</span>
+                <span>{domains.length} custom domain(s) configured</span>
                 <button
-                  onClick={() => alert('Routing Policies: CloudScale Anycast Geo-DNS directs requests to closest PoP within 10ms.')}
+                  onClick={() => showToast('Point your domain\'s CNAME or A record to this server IP, then click Add Domain.')}
                   className="text-[#4cd7f6] hover:underline flex items-center gap-1 transition-colors"
                 >
-                  Routing policies
+                  How to configure
                   <span className="material-symbols-outlined text-[14px]">arrow_forward</span>
                 </button>
               </div>
@@ -1204,8 +1403,12 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               <div className="flex items-center gap-3 flex-wrap">
                 <div className="flex items-center gap-2 font-mono text-xs text-[#bbcabf]">
                   <span className="w-2 h-2 rounded-full bg-[#4edea3] animate-pulse-glow" />
-                  <span className="text-[#86948a]">Connected:</span>
-                  <span className="text-[#e5e1e4]">prod-api-gateway-c87d4984f-2x9l</span>
+                  <span className="text-[#86948a]">Watching:</span>
+                  <span className="text-[#e5e1e4]">
+                    {services.length > 0
+                      ? `${services[0].name} (${services[0].id})`
+                      : 'No active deployments'}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <input
@@ -1240,46 +1443,50 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               className="p-4 font-mono text-xs space-y-1.5 overflow-x-auto text-[#e5e1e4]/90 leading-relaxed max-h-72 bg-[#0e0e10]"
             >
               {filteredLogs.length === 0 ? (
-                <div className="text-[#86948a] py-2">-- No matching log lines in buffer. Stream active... --</div>
+                <div className="text-[#86948a] py-2">
+                  {logs.length === 0
+                    ? '-- No logs yet. Deploy a project to see output here. --'
+                    : '-- No matching log lines in buffer. --'}
+                </div>
               ) : (
                 filteredLogs.map((log, idx) => (
                   <div key={idx} className="flex items-start gap-2">
                     <span className="text-[#86948a] shrink-0">[{log.timestamp}]</span>
                     <span
-                      className={`font-semibold shrink-0 ${log.level === 'INFO'
-                          ? 'text-[#4cd7f6]'
-                          : log.level === 'BUILD'
-                            ? 'text-[#4edea3]'
-                            : log.level === 'SUCCESS'
-                              ? 'text-[#4edea3]'
-                              : log.level === 'ROUTING'
-                                ? 'text-[#4edea3]'
-                                : log.level === 'RUN'
-                                  ? 'text-[#4edea3]'
-                                  : 'text-[#d0bcff]'
-                        }`}
+                      className={`font-semibold shrink-0 ${
+                        log.level === 'ERROR' ? 'text-red-400'
+                        : log.level === 'SUCCESS' ? 'text-[#4edea3]'
+                        : log.level === 'BUILD' ? 'text-[#d0bcff]'
+                        : log.level === 'RUN' ? 'text-[#4edea3]'
+                        : log.level === 'INFO' ? 'text-[#4cd7f6]'
+                        : 'text-[#bbcabf]'
+                      }`}
                     >
                       {log.level}
                     </span>
-                    <span className="text-[#e5e1e4]">{log.message}</span>
+                    <span className="text-[#e5e1e4] break-all">{log.message}</span>
                   </div>
                 ))
               )}
-              {services.length > 0 && (
-                <div className="flex items-center gap-2 pt-1 border-t border-[#3c4a42]/40 mt-2 text-[#86948a] flex-wrap">
-                  <span className="text-[#4edea3] font-bold">✓ Deployment complete.</span>
-                  <span className="text-[#e5e1e4]">Available at:</span>
-                  <a
-                    href={services[0].endpoint}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[#4cd7f6] hover:underline font-mono"
-                  >
-                    {services[0].endpoint}
-                  </a>
-                  <span className="text-[11px] text-[#86948a]">({services[0].region || 'local-edge'})</span>
-                </div>
-              )}
+              {/* Show latest active HTTP deployment at bottom of terminal */}
+              {(() => {
+                const latest = services.find(s => s.status === 'healthy' && s.kind === 'http');
+                if (!latest) return null;
+                return (
+                  <div className="flex items-center gap-2 pt-1 border-t border-[#3c4a42]/40 mt-2 text-[#86948a] flex-wrap">
+                    <span className="text-[#4edea3] font-bold">✓ Latest active deployment:</span>
+                    <a
+                      href={latest.endpoint}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[#4cd7f6] hover:underline font-mono"
+                    >
+                      {latest.endpoint}
+                    </a>
+                    <span className="text-[11px] text-[#86948a]">({latest.name})</span>
+                  </div>
+                );
+              })()}
             </div>
           </section>
 
@@ -1320,9 +1527,13 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
                   onChange={(e) => setNewDomainTarget(e.target.value)}
                   className="w-full bg-[#0e0e10] border border-[#3c4a42] rounded-lg px-3 py-2 text-xs font-mono text-[#e5e1e4] focus:outline-none focus:border-[#4edea3]"
                 >
-                  <option value="api-gateway.internal">api-gateway.internal</option>
-                  <option value="web-frontend.internal">web-frontend.internal</option>
-                  <option value="auth-service.internal">auth-service.internal</option>
+                  <option value="">-- Select a target service --</option>
+                   {services.filter(s => s.kind === 'http' && s.status === 'healthy').map(s => (
+                     <option key={s.id} value={s.id}>{s.name} ({s.id})</option>
+                   ))}
+                   {services.filter(s => s.kind === 'http' && s.status === 'healthy').length === 0 && (
+                     <option disabled>No active HTTP deployments yet</option>
+                   )}
                 </select>
               </div>
               <p className="text-[11px] text-[#86948a]">
@@ -1336,6 +1547,89 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               </button>
             </form>
           </div>
+        </div>
+      )}
+      {/* Delete Confirmation Modal */}
+      {deleteConfirmation && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-fade-in-up">
+          <div className="bg-[#1c1b1d] border border-red-500/30 rounded-xl p-6 max-w-sm w-full shadow-2xl relative">
+            <div className="flex items-center gap-3 mb-4 text-red-400">
+              <span className="material-symbols-outlined text-[24px]">warning</span>
+              <h3 className="text-base font-semibold">Confirm Deletion</h3>
+            </div>
+            <p className="text-sm text-[#bbcabf] mb-6 leading-relaxed">
+              Are you sure you want to delete <span className="text-[#e5e1e4] font-semibold">"{deleteConfirmation.name}"</span>? This will stop and remove it permanently.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setDeleteConfirmation(null)}
+                className="px-4 py-2 text-xs font-semibold text-[#bbcabf] hover:text-[#e5e1e4] transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteDeployment}
+                className="px-4 py-2 bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 font-semibold text-xs rounded-lg transition-all cursor-pointer"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Env Paste Modal */}
+      {showEnvPasteModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-fade-in-up">
+          <div className="bg-[#1c1b1d] border border-[#3c4a42] rounded-xl p-6 max-w-md w-full shadow-2xl relative">
+            <h3 className="text-base font-semibold text-[#e5e1e4] mb-4 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[#4cd7f6]">content_paste</span>
+              Paste .env contents
+            </h3>
+            <textarea
+              value={envPasteContent}
+              onChange={(e) => setEnvPasteContent(e.target.value)}
+              placeholder="KEY=value\nANOTHER_KEY=another_value"
+              className="w-full h-32 bg-[#0e0e10] border border-[#3c4a42] rounded-lg p-3 text-xs font-mono text-[#e5e1e4] placeholder:text-[#4c5a52] focus:outline-none focus:border-[#4cd7f6] mb-4"
+            />
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowEnvPasteModal(false);
+                  setEnvPasteContent('');
+                }}
+                className="px-4 py-2 text-xs font-semibold text-[#bbcabf] hover:text-[#e5e1e4] transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (!envPasteContent) return;
+                  const parsed = envPasteContent.split('\n')
+                    .map(l => l.trim())
+                    .filter(l => l && !l.startsWith('#') && l.includes('='))
+                    .map(l => { const idx = l.indexOf('='); return { key: l.slice(0, idx).trim(), value: l.slice(idx + 1).trim().replace(/^["']|["']$/g, '') }; });
+                  if (parsed.length > 0) setEnvVars(parsed);
+                  setEnvPasteContent('');
+                  setShowEnvPasteModal(false);
+                }}
+                className="px-4 py-2 bg-[#4edea3] text-[#003824] hover:bg-[#6ffbbe] font-semibold text-xs rounded-lg transition-all cursor-pointer"
+              >
+                Parse & Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-4 right-4 z-[100] bg-[#1c1b1d] border border-[#3c4a42] text-[#e5e1e4] px-4 py-3 rounded-lg shadow-2xl flex items-center gap-3 animate-fade-in-up">
+          <span className="material-symbols-outlined text-[#4cd7f6] text-[18px]">info</span>
+          <p className="text-xs font-medium">{toastMessage}</p>
+          <button onClick={() => setToastMessage(null)} className="text-[#86948a] hover:text-[#e5e1e4] ml-2">
+            <span className="material-symbols-outlined text-[16px]">close</span>
+          </button>
         </div>
       )}
     </div>
