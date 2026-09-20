@@ -223,6 +223,27 @@ const SENSITIVE_ENV_KEYS = new Set([
 ]);
 
 /**
+ * Resolves a tenant-isolated directory path for a deployment.
+ * Ensures user repositories are isolated under .deployments/<safe_user_id>/<id>/
+ */
+function getTenantRepoPath(userId: string, id: string): string {
+  const safeUserId = (userId || 'anonymous').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const userDir = path.join(DEPLOYMENTS_DIR, safeUserId);
+  if (!fs.existsSync(userDir)) {
+    try { fs.mkdirSync(userDir, { recursive: true, mode: 0o700 }); } catch {}
+  }
+  return path.join(userDir, id);
+}
+
+function resolveExistingRepoPath(userId: string, id: string): string {
+  const tenantPath = getTenantRepoPath(userId, id);
+  if (fs.existsSync(tenantPath)) return tenantPath;
+  const legacyPath = path.join(DEPLOYMENTS_DIR, id);
+  if (fs.existsSync(legacyPath)) return legacyPath;
+  return tenantPath;
+}
+
+/**
  * Returns a sanitized env object safe to pass to spawned child processes.
  * Only passes minimal system vars + user-provided env vars.
  * Never leaks CloudScale secrets to deployed code.
@@ -638,7 +659,7 @@ app.post('/api/deploy', deployRateLimit, async (req, res) => {
   const result = db.prepare('SELECT MAX(port) as maxPort FROM deployments').get() as { maxPort: number | null };
   const port = (result.maxPort || 4000) + 1;
   const id = generateId();
-  const repoPath = path.join(DEPLOYMENTS_DIR, id);
+  const repoPath = getTenantRepoPath(userId, id);
 
   db.prepare(
     'INSERT INTO deployments (id, userId, repoUrl, port, status, kind, branch) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -1162,7 +1183,7 @@ app.delete('/api/deploy/:id', async (req, res) => {
     if (USE_DOCKER) await stopDockerDeployment(id);
 
     // Clean up cloned repo from disk
-    const repoPath = path.join(DEPLOYMENTS_DIR, id);
+    const repoPath = resolveExistingRepoPath(userId, id);
     if (fs.existsSync(repoPath)) {
       try {
         fs.rmSync(repoPath, { recursive: true, force: true });
@@ -1464,7 +1485,7 @@ app.post('/api/deploy/:id/rollback', (req, res) => {
 
   // In a full production system with Docker registry, this would pull the old image tag.
   // For CloudScale dev mode, we check out the old commit and rebuild.
-  const repoPath = path.join(DEPLOYMENTS_DIR, id);
+  const repoPath = resolveExistingRepoPath(userId, id);
   if (!fs.existsSync(repoPath)) return res.status(400).json({ error: 'Repo deleted, cannot rollback' });
 
   db.prepare('UPDATE deployments SET status = ? WHERE id = ?').run('deploying', id);
