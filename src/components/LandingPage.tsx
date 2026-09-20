@@ -17,6 +17,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigateToConsole })
   const [prStatus, setPrStatus] = useState<string>('ACTIVE PR #142');
   const [isPinging, setIsPinging] = useState<boolean>(false);
   const [telemetryReqs, setTelemetryReqs] = useState<string>('14.2M/s');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const [demoModalOpen, setDemoModalOpen] = useState<boolean>(false);
   const [pings, setPings] = useState({
     sfo: 8,
@@ -84,7 +85,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigateToConsole })
               className="flex items-center gap-2 text-left cursor-pointer"
             >
               <span className="text-lg font-semibold text-[#e5e1e4] tracking-tight">CloudScale</span>
-              <span className="px-2 py-0.5 rounded-full bg-[#2a2a2c] font-mono text-xs text-[#4edea3] border border-[#4edea3]/20">
+              <span className="px-2 py-0.5 rounded-full bg-[#2a2a2c] font-mono text-xs text-[#4edea3] border border-[#4edea3]/20 flex items-center gap-1.5">
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#4edea3] opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[#4edea3]"></span>
+                </span>
                 v2.4
               </span>
             </button>
@@ -146,14 +151,25 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigateToConsole })
               <span>Open Console</span>
             </button>
             <button
-              onClick={onNavigateToConsole}
-              className="w-8 h-8 rounded-full bg-[#4edea3]/20 border border-[#4edea3]/40 flex items-center justify-center hover:bg-[#4edea3]/30 transition-colors"
-              title="Open Cluster Console"
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="lg:hidden w-8 h-8 rounded bg-[#1c1b1d] border border-[#3c4a42]/40 flex items-center justify-center text-[#e5e1e4]"
             >
-              <span className="material-symbols-outlined text-[#4edea3] text-[18px]">dashboard</span>
+              <span className="material-symbols-outlined text-[20px]">{mobileMenuOpen ? 'close' : 'menu'}</span>
             </button>
           </div>
         </div>
+
+        {/* Mobile Dropdown Nav */}
+        {mobileMenuOpen && (
+          <div className="lg:hidden bg-[#0e0e10]/95 backdrop-blur-2xl border-b border-[#3c4a42]/30 px-6 py-4 flex flex-col gap-3 font-mono text-sm animate-fadeIn">
+            <a href="#capabilities" onClick={() => setMobileMenuOpen(false)} className="text-[#bbcabf] hover:text-[#4edea3] py-1">Features</a>
+            <a href="#comparison" onClick={() => setMobileMenuOpen(false)} className="text-[#bbcabf] hover:text-[#4edea3] py-1">Comparison</a>
+            <a href="#architecture" onClick={() => setMobileMenuOpen(false)} className="text-[#bbcabf] hover:text-[#4edea3] py-1">Architecture</a>
+            <button onClick={() => { setMobileMenuOpen(false); onNavigateToConsole(); }} className="text-[#4edea3] text-left py-1 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[16px]">dashboard</span> Console Dashboard
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Main Content */}
@@ -170,7 +186,17 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigateToConsole })
             <div className="absolute top-20 left-1/4 w-[400px] h-[400px] bg-[#4cd7f6]/10 blur-[120px] pointer-events-none rounded-full" />
 
             {/* 1. HERO SECTION */}
-            <section className="max-w-[1440px] mx-auto px-4 md:px-6 lg:px-8 pt-8 pb-12 flex flex-col items-center text-center relative z-10">
+            <section className="max-w-[1440px] mx-auto px-4 md:px-6 lg:px-8 pt-10 pb-12 flex flex-col items-center text-center relative z-10">
+
+              {/* Pulsing Live Badge */}
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#162720]/80 border border-[#4edea3]/30 text-xs font-mono text-[#4edea3] mb-6 backdrop-blur-md shadow-[0_0_15px_rgba(78,222,163,0.2)]">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#4edea3] opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-[#4edea3]"></span>
+                </span>
+                <span>Zero-Downtime Microservice Platform</span>
+              </div>
+
 
               {/* Main Headline */}
               <h1 className="text-3xl md:text-5xl lg:text-[54px] lg:leading-[62px] text-[#e5e1e4] max-w-4xl tracking-tight mb-4 font-semibold">

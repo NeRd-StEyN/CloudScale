@@ -517,6 +517,19 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
 
         {/* Center / Right Search & Actions */}
         <div className="flex items-center gap-3">
+          {/* Quick Search Bar */}
+          <div className="relative hidden sm:flex items-center">
+            <span className="material-symbols-outlined absolute left-2.5 text-[16px] text-[#bbcabf] pointer-events-none">search</span>
+            <input
+              type="text"
+              placeholder="Search workloads..."
+              value={globalSearch}
+              onChange={(e) => setGlobalSearch(e.target.value)}
+              className="w-44 lg:w-60 bg-[#1c1b1d] border border-[#3c4a42]/50 focus:border-[#4edea3]/60 rounded-md pl-8 pr-12 py-1 text-xs text-[#e5e1e4] placeholder-[#86948a] outline-none transition-all font-mono"
+            />
+            <kbd className="absolute right-2 px-1.5 py-0.5 text-[10px] font-mono text-[#bbcabf] bg-[#2a2a2c] rounded border border-[#3c4a42]/40 pointer-events-none">⌘K</kbd>
+          </div>
+
           {/* Quick Action Icons */}
           <div className="flex items-center space-x-1">
             <button
@@ -534,8 +547,6 @@ export const ConsoleDashboard: React.FC<ConsoleDashboardProps> = ({ onNavigateTo
               <span className="material-symbols-outlined text-[18px]">help</span>
             </button>
           </div>
-
-
 
           {/* User Avatar */}
           <div className="relative ml-1 cursor-pointer flex items-center justify-center">
