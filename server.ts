@@ -688,13 +688,31 @@ app.post('/api/deploy', deployRateLimit, async (req, res) => {
     }
     log('✅ Repository cloned. Running buildpack detection...');
 
-    // Save user-provided env vars to database
+    // Save user-provided env vars to database and write .env files to root + subdirectories
     if (Object.keys(userEnv).length > 0) {
       const insertEnv = db.prepare('INSERT INTO environment_variables (id, deploymentId, key, value) VALUES (?, ?, ?, ?)');
+      const envLines: string[] = [];
       for (const [key, val] of Object.entries(userEnv)) {
         insertEnv.run(`env_${Date.now()}_${Math.random().toString(36).substring(2,6)}`, id, key, val);
+        envLines.push(`${key}=${val}`);
       }
-      log(`🔐 Written ${Object.keys(userEnv).length} environment variable(s) to database`);
+      const envContent = envLines.join('\n') + '\n';
+      
+      // Write to root .env
+      try { fs.writeFileSync(path.join(repoPath, '.env'), envContent); } catch {}
+
+      // Write to subdirectories (client/.env, server/.env, frontend/.env, backend/.env, etc.)
+      const subDirs = ['client', 'frontend', 'server', 'backend', 'web', 'api', 'ui', 'app'];
+      for (const sub of subDirs) {
+        const subFolder = path.join(repoPath, sub);
+        try {
+          if (fs.existsSync(subFolder) && fs.statSync(subFolder).isDirectory()) {
+            fs.writeFileSync(path.join(subFolder, '.env'), envContent);
+          }
+        } catch {}
+      }
+
+      log(`🔐 Written ${Object.keys(userEnv).length} environment variable(s) to root & subfolder .env files`);
     }
 
     // ─── Buildpack Detection ────────────────────────────────────────────────
